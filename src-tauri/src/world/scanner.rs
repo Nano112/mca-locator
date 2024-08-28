@@ -1,26 +1,22 @@
 use std::collections::HashMap;
-use std::fs::{File, ReadDir};
 use std::path::{Path, PathBuf};
-use std::{fs, iter, thread};
+use std::fs::{self, File};
 use std::io::Read;
-use serde::Serialize;
-use fastnbt::Value;
-use fastnbt::error::Result as NbtResult;
-use mca::RegionReader;
-use serde_json;
-use tauri::{Window, Manager};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::channel;
+use std::thread;
+use fastnbt::{from_bytes, Value};
 use rayon::prelude::*;
-use tauri::regex::Regex;
+use tauri::Window;
+use mca::RegionReader;
+use serde::Serialize;
 
 #[derive(Serialize, Clone)]
 pub struct ChunkInfo {
-    x: i64,
-    z: i64,
+    x: i32,
+    z: i32,
     size: usize,
-    dominant_biome: i8, // Most present biome ID as a number
-    nbt_json: serde_json::Value, // JSON representation of NBT
+    dominant_biome: i32, // Most present biome ID as a number
 }
 
 #[derive(Serialize, Clone)]
@@ -46,46 +42,6 @@ impl RegionCoordinate {
         (((self.x - other.x).pow(2) + (self.z - other.z).pow(2)) as f64).sqrt()
     }
 }
-
-fn generate_spiral_coordinates(limit: i32) -> Vec<RegionCoordinate> {
-    let mut coords = Vec::new();
-    let mut x = 0;
-    let mut z = 0;
-    let mut dx = 0;
-    let mut dz = -1;
-    let mut t = 0;
-    let max_t = limit * 2;
-
-    for _ in 0..max_t {
-        if (-limit <= x && x <= limit) && (-limit <= z && z <= limit) {
-            coords.push(RegionCoordinate { x, z });
-        }
-
-        if x == z || (x < 0 && x == -z) || (x > 0 && x == 1 - z) {
-            let temp = dx;
-            dx = -dz;
-            dz = temp;
-        }
-
-        x += dx;
-        z += dz;
-        t += 1;
-    }
-
-    coords
-}
-
-fn parse_region_coordinates(file_name: &str) -> Option<RegionCoordinate> {
-    let parts: Vec<&str> = file_name.trim_end_matches(".mca").split('.').collect();
-    if parts.len() == 3 && parts[0] == "r" {
-        let x = parts[1].parse().ok()?;
-        let z = parts[2].parse().ok()?;
-        Some(RegionCoordinate { x, z })
-    } else {
-        None
-    }
-}
-
 
 #[tauri::command]
 pub fn analyze_mca_folder(window: Window, path: String) -> Result<(), String> {
@@ -175,7 +131,6 @@ pub fn get_mca_file_count(path: String) -> Result<usize, String> {
 }
 
 
-
 #[tauri::command]
 pub fn analyze_region(file_path: &str) -> Result<RegionAnalysis, String> {
     let path = Path::new(file_path);
@@ -196,44 +151,21 @@ pub fn analyze_region(file_path: &str) -> Result<RegionAnalysis, String> {
                     let chunk = region.get_chunk(x, z).ok()??;
                     let decompressed = chunk.decompress().ok()?;
 
-                    // Deserialize NBT data into a fastnbt::Value
-                    let mut nbt_value: HashMap<String, Value> = fastnbt::from_bytes(&decompressed).ok()?;
+                    // Selective NBT parsing
+                    let (x_pos, z_pos, biomes) = parse_chunk_data(&decompressed)?;
 
-                    // Extract and validate necessary data
-                    let level = match nbt_value.get_mut("Level") {
-                        Some(Value::Compound(level)) => level,
-                        _ => return None,
-                    };
+                    // Early bailout condition
+                    if x_pos.abs() > 1000 || z_pos.abs() > 1000 {
+                        return None;
+                    }
 
-                    let x_pos = level.get("xPos").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let z_pos = level.get("zPos").and_then(|v| v.as_i64()).unwrap_or(0);
-
-                    // Bailout condition if the chunk is too far from (0, 0)
-                    // if x_pos.abs() > 1000 || z_pos.abs() > 1000 {
-                    //     return None;
-                    // }
-
-                    let dominant_biome = level.get_mut("Biomes")
-                        .and_then(|biomes| match biomes {
-                            Value::ByteArray(biomes) => {
-                                let mut biome_counts = HashMap::new();
-                                for &biome in biomes.iter() {
-                                    *biome_counts.entry(biome).or_insert(0) += 1;
-                                }
-                                biome_counts.into_iter()
-                                    .max_by_key(|&(_, count)| count)
-                                    .map(|(biome, _)| biome)
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or(-1);
+                    let dominant_biome = calculate_dominant_biome(biomes);
 
                     Some(ChunkInfo {
                         x: x_pos,
                         z: z_pos,
                         size: decompressed.len(),
                         dominant_biome,
-                        nbt_json: "{}".parse().unwrap(),  // Placeholder for actual NBT JSON
                     })
                 })
                 .collect::<Vec<ChunkInfo>>()
@@ -244,4 +176,83 @@ pub fn analyze_region(file_path: &str) -> Result<RegionAnalysis, String> {
         file_name,
         chunks,
     })
+}
+
+
+fn parse_chunk_data(data: &[u8]) -> Option<(i32, i32, Vec<i32>)> {
+    let root: Value = from_bytes(data).ok()?;
+
+    if let Value::Compound(root_compound) = root {
+        if let Some(Value::Compound(level)) = root_compound.get("Level") {
+            let x_pos = level.get("xPos").and_then(|v| if let Value::Int(x) = v { Some(*x) } else { None })?;
+            let z_pos = level.get("zPos").and_then(|v| if let Value::Int(z) = v { Some(*z) } else { None })?;
+
+            let biomes = if let Some(Value::IntArray(biomes)) = level.get("Biomes") {
+                biomes.clone()
+            } else {
+                return None;
+            };
+
+            return Some((x_pos, z_pos, biomes.to_vec()));
+        }
+    }
+
+    None
+}
+
+// Optimized biome calculation
+pub(crate) fn calculate_dominant_biome(biomes: Vec<i32>) -> i32 {
+    let mut biome_counts = HashMap::new();
+    let mut max_count = 0;
+    let mut dominant_biome = -1;
+
+    for biome in biomes {
+        let count = biome_counts.entry(biome).or_insert(0);
+        *count += 1;
+        if *count > max_count {
+            max_count = *count;
+            dominant_biome = biome;
+        }
+    }
+
+    dominant_biome
+}
+
+fn generate_spiral_coordinates(limit: i32) -> Vec<RegionCoordinate> {
+    let mut coords = Vec::new();
+    let mut x = 0;
+    let mut z = 0;
+    let mut dx = 0;
+    let mut dz = -1;
+    let mut t = 0;
+    let max_t = limit * 2;
+
+    for _ in 0..max_t {
+        if (-limit <= x && x <= limit) && (-limit <= z && z <= limit) {
+            coords.push(RegionCoordinate { x, z });
+        }
+
+        if x == z || (x < 0 && x == -z) || (x > 0 && x == 1 - z) {
+            let temp = dx;
+            dx = -dz;
+            dz = temp;
+        }
+
+        x += dx;
+        z += dz;
+        t += 1;
+    }
+
+    coords
+}
+
+fn parse_region_coordinates(file_name: &str) -> Option<RegionCoordinate> {
+    let parts: Vec<&str> = file_name.trim_end_matches(".mca").split('.').collect();
+    if parts.len() == 3 && parts[0] == "r" {
+        let x = parts[1].parse().ok()?;
+        let z = parts[2].parse().ok()?;
+        Some(RegionCoordinate { x, z })
+    } else {
+        None
+    }
 }
